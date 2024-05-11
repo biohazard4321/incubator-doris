@@ -208,11 +208,6 @@ Status ExecEnv::_init(const std::vector<StorePath>& store_paths,
                               .set_max_threads(32)
                               .build(&_send_table_stats_thread_pool));
 
-    static_cast<void>(ThreadPoolBuilder("S3DownloaderDownloadPollerThreadPool")
-                              .set_min_threads(4)
-                              .set_max_threads(16)
-                              .build(&_s3_downloader_download_poller_thread_pool));
-
     auto [s3_file_upload_min_threads, s3_file_upload_max_threads] =
             get_num_threads(config::num_s3_file_upload_thread_pool_min_thread,
                             config::num_s3_file_upload_thread_pool_max_thread);
@@ -240,16 +235,6 @@ Status ExecEnv::_init(const std::vector<StorePath>& store_paths,
                               .set_max_threads(1)
                               .set_max_queue_size(1000000)
                               .build(&_lazy_release_obj_pool));
-
-    static_cast<void>(ThreadPoolBuilder("SyncLoadForTabletsThreadPool")
-                              .set_max_threads(config::sync_load_for_tablets_thread)
-                              .set_min_threads(config::sync_load_for_tablets_thread)
-                              .build(&_sync_load_for_tablets_thread_pool));
-
-    static_cast<void>(ThreadPoolBuilder("S3DownloaderDownloadThreadPool")
-                              .set_min_threads(16)
-                              .set_max_threads(64)
-                              .build(&_s3_downloader_download_thread_pool));
 
     // NOTE: runtime query statistics mgr could be visited by query and daemon thread
     // so it should be created before all query begin and deleted after all query and daemon thread stoppped
@@ -325,11 +310,6 @@ Status ExecEnv::_init(const std::vector<StorePath>& store_paths,
     if (config::is_cloud_mode()) {
         std::cout << "start BE in cloud mode" << std::endl;
         _storage_engine = std::make_unique<CloudStorageEngine>(options.backend_uid);
-        _file_cache_block_downloader = new io::FileCacheBlockS3Downloader(
-                *dynamic_cast<CloudStorageEngine*>(_storage_engine.get()));
-        _cloud_warm_up_manager =
-                new CloudWarmUpManager(*dynamic_cast<CloudStorageEngine*>(_storage_engine.get()));
-        _tablet_hotspot = new TabletHotspot();
     } else {
         std::cout << "start BE in local mode" << std::endl;
         _storage_engine = std::make_unique<StorageEngine>(options);
@@ -506,9 +486,18 @@ Status ExecEnv::_init_mem_env() {
     if (segment_cache_capacity < 0 || segment_cache_capacity > fd_number * 2 / 5) {
         segment_cache_capacity = fd_number * 2 / 5;
     }
+
+    int64_t segment_cache_mem_limit =
+            MemInfo::mem_limit() / 100 * config::segment_cache_memory_percentage;
+    // config::segment_cache_memory_percentage;
+    int64_t min_segment_cache_mem_limit =
+            min(segment_cache_mem_limit, segment_cache_capacity *
+                                                 config::estimated_num_columns_per_segment *
+                                                 config::estimated_mem_per_column_reader);
+    _segment_loader = new SegmentLoader(min_segment_cache_mem_limit);
     LOG(INFO) << "segment_cache_capacity <= fd_number * 2 / 5, fd_number: " << fd_number
-              << " segment_cache_capacity: " << segment_cache_capacity;
-    _segment_loader = new SegmentLoader(segment_cache_capacity);
+              << " segment_cache_capacity: " << segment_cache_capacity
+              << " min_segment_cache_mem_limit " << min_segment_cache_mem_limit;
 
     _schema_cache = new SchemaCache(config::schema_cache_capacity);
 
@@ -664,11 +653,6 @@ void ExecEnv::destroy() {
     SAFE_DELETE(_schema_cache);
     SAFE_DELETE(_segment_loader);
     SAFE_DELETE(_row_cache);
-    if (config::is_cloud_mode()) {
-        SAFE_DELETE(_file_cache_block_downloader);
-        SAFE_DELETE(_tablet_hotspot);
-        SAFE_DELETE(_cloud_warm_up_manager);
-    }
 
     // Free resource after threads are stopped.
     // Some threads are still running, like threads created by _new_load_stream_mgr ...
@@ -702,7 +686,6 @@ void ExecEnv::destroy() {
     _lazy_release_obj_pool.reset(nullptr);
     _send_report_thread_pool.reset(nullptr);
     _send_table_stats_thread_pool.reset(nullptr);
-    _s3_downloader_download_poller_thread_pool.reset(nullptr);
     _buffered_reader_prefetch_thread_pool.reset(nullptr);
     _s3_file_upload_thread_pool.reset(nullptr);
     _send_batch_thread_pool.reset(nullptr);
